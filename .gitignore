@@ -4,3 +4,5 @@
 /.esphome/
 /secrets.yaml
 /.vscode/
+**/*.log
+**/__pycache__/**

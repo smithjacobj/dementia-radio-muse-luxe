@@ -1,24 +1,40 @@
 globals:
-  - id: play_requested
+  - id: play_requested # used for watchdog state/restoring play after crash/power loss
     type: bool
     restore_value: true
     initial_value: 'false'
-  - id: volume_setting
+  - id: volume_setting # used for restoring volume after a crash/power loss
     type: float
     restore_value: true
     initial_value: '0.3'
-  - id: stream_url
+  - id: stream_url # used to be able to update stream URL from MQTT
     type: std::string
-    restore_value: false
+    restore_value: true
     initial_value: '"http://live-aacplus-64.kexp.org/kexp64.aac"'
 
+substitutions:
+  lib_path: !secret lib_path # not really secret but this makes sure you configure it!
+  device_name: franks-dementia-radio
+  friendly_name: Frank's Dementia Radio
+  default_vol: '0.25'
+  min_vol: '0.05'
+  max_vol: '1.0'
+  vol_step: '0.05'
+  wireguard_address: 172.16.0.2
+
 esphome:
-  name: dementia-radio-muse-luxe
-  friendly_name: Dementia Radio Muse Luxe
+  name: ${device_name}
+  friendly_name: ${friendly_name}
   name_add_mac_suffix: true
   project:
     name: raspiaudio.muse-luxe
     version: "1.0"
+  platformio_options:
+    build_flags: -DAUDIO_LOG
+  libraries:
+    - WiFi # ESP32-audioI2S dep
+    - WiFiClientSecure # ESP32-audioI2S dep
+    - ${lib_path}/ESP32-audioI2S
   min_version: 2023.5.0
   on_boot:
     - priority: 600
@@ -60,7 +76,7 @@ script:
           condition:
             media_player.is_playing
           timeout: 15s 
-      - media_player.volume_set: !lambda return id(volume_setting);
+      - media_player.volume_set: !lambda return id(volume_sensor).state;
   - id: stop_playing
     mode: single
     then:
@@ -99,12 +115,20 @@ esp32:
   framework:
     type: arduino
 
+time:
+  - platform: sntp
+    id: sntp_time
+
+wireguard:
+  <<: !secret wireguard_config
+  address: ${wireguard_address}
+  netmask: 255.255.0.0
+  peer_allowed_ips: 172.16.0.0/16
+  reboot_timeout: 0s # please don't reboot, not critical
+
+
 logger:
-  # level: WARN
-  # level: VERY_VERBOSE
-  # logs:
-  #   fastled: DEBUG
-  #   i2c.arduino: DEBUG
+    
 ota:
 
 i2c:
@@ -118,6 +142,7 @@ wifi:
   # fallback for captive portal (so a user could potentially fix changed AP credentials)
   ap:
     !secret fallback_config
+  use_address: ${wireguard_address}
 
 captive_portal:
 
@@ -128,18 +153,20 @@ mqtt:
   reboot_timeout: 0s
   setup_priority: -150
   discovery_retain: false
+  on_message:
+    topic: homeassistant/${device_name}/update_stream_url
+    then:
+      - lambda: |-
+          id(stream_url_sensor).publish_state(x);
 
 external_components:
   - source: github://pr#3552 # DAC support https://github.com/esphome/esphome/pull/3552
     components: [es8388]
     refresh: 0s
-  - source: github://pr#5515
-    components: [i2s_audio]
-    refresh: 0s
   - source:
       type: local
       path: "./components"
-    components: [mqtt]
+    components: [mqtt, i2s_audio]
 
 es8388:
 
@@ -176,6 +203,7 @@ text_sensor:
   - id: stream_url_sensor
     platform: template
     name: Stream URL
+    icon: "mdi:icon-link"
     lambda:
       if (id(stream_url) != id(stream_url_sensor).state)
         return id(stream_url);
@@ -214,6 +242,33 @@ sensor:
     update_interval: 15s
     on_value:
       - script.execute: wifi_state_script
+  - platform: template
+    internal: true
+    id: volume_sensor
+    name: "Volume"
+    lambda: return id(volume_setting);
+    update_interval: never
+    filters:
+      clamp:
+        min_value: ${min_vol}
+        max_value: ${max_vol}
+    on_value:
+      - media_player.volume_set: !lambda return id(volume_sensor).state;
+      - lambda: id(volume_setting) = id(volume_sensor).state;
+      - lambda: |-
+          float volume_pct = id(volume_sensor).state * 100;
+          id(volume_display_sensor).publish_state(volume_pct);
+  - platform: template
+    id: volume_display_sensor
+    name: "Volume"
+    icon: "mdi:icon-volume-up"
+    lambda: return id(volume_sensor).state * 100;
+    unit_of_measurement: '%'
+    accuracy_decimals: 0
+    update_interval: never
+  - platform: wireguard
+    latest_handshake:
+      name: 'WireGuard Latest Handshake'
 
 binary_sensor:
   - platform: gpio
@@ -226,12 +281,7 @@ binary_sensor:
         pullup: true
     name: Volume Up
     on_click:
-      - media_player.volume_set: !lambda |-
-          if (id(volume_setting) < .9f)
-            id(volume_setting) += 0.1f;
-          else
-            id(volume_setting) = 1.0f;
-          return id(volume_setting);
+      - lambda: id(volume_sensor).publish_state(id(volume_setting) + ${vol_step});
   - platform: gpio
     internal: true
     pin:
@@ -242,12 +292,7 @@ binary_sensor:
         pullup: true
     name: Volume Down
     on_click:
-      - media_player.volume_set: !lambda |-
-          if (id(volume_setting) > 0.2f)
-            id(volume_setting) -= 0.1f;
-          else
-            id(volume_setting) = 0.1f;
-          return id(volume_setting);
+      - lambda: id(volume_sensor).publish_state(id(volume_setting) - ${vol_step});
   - platform: gpio
     internal: true
     pin:
@@ -269,12 +314,15 @@ binary_sensor:
           condition: 
             lambda: return id(play_requested);
           then:
-            - lambda: id(volume_setting) = 0.3;
+            - lambda: id(volume_sensor).publish_state(${default_vol});
             - script.execute: start_playing
           else:
             - script.execute: stop_playing
     # publish_initial_state: true # turns out this crashes when MQTT is enabled but not started
                                   # until late
+  - platform: wireguard
+    status:
+      name: 'WireGuard Status'
 
 light:
   - platform: fastled_clockless
@@ -288,6 +336,7 @@ light:
     gamma_correct: 2.8
     effects:
       - pulse:
+    restore_mode: ALWAYS_OFF
     default_transition_length: 0s
 
 output:
