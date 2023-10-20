@@ -310,6 +310,7 @@ binary_sensor:
     name: Is Playing
     lambda: return id(play_requested);
     on_state:
+      - wait_until: wifi.connected
       - if:
           condition: 
             lambda: return id(play_requested);
@@ -325,14 +326,14 @@ binary_sensor:
       name: 'WireGuard Status'
 
 light:
-  - platform: fastled_clockless
+  - platform: neopixelbus # fastled liked to stick on white
     internal: true
     name: None
     id: top_led
     pin: GPIO22
-    chipset: SK6812
+    variant: SK6812
     num_leds: 1
-    rgb_order: grb
+    type: grb
     gamma_correct: 2.8
     effects:
       - pulse:
